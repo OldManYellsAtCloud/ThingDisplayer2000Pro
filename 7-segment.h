@@ -1,6 +1,9 @@
 #ifndef SEVENSEGMENT_H
 #define SEVENSEGMENT_H
 
+#include <linux/types.h>
+#include <linux/of.h>
+
 #define SEVENSEGMENT_MAX_CLIENTS    3
 
 #define SEVENSEGMENT_CLEAR_SCREEN   0x76
@@ -23,6 +26,34 @@ enum SevenSegmentProcFile {
     SEVENSEGMENT_NAME_FILE,
     SEVENSEGMENT_TEXT_FILE,
     SEVENSEGMENT_UNKNOWN_FILE
+};
+
+enum SevenSegmentDeviceType {
+    SEVENSEGMENT_I2C,
+    SEVENSEGMENT_SPI
+};
+
+typedef union {
+    struct i2c_client *i2c;
+    struct spi_device *spi;
+} client_type;
+
+struct seven_segment_display{
+    client_type device;
+    enum SevenSegmentDeviceType device_type;
+    char text[5];
+    uint8_t digit1;
+    uint8_t digit2;
+    uint8_t digit3;
+    uint8_t digit4;
+    uint8_t brightness;
+    uint8_t decimals;
+    struct proc_dir_entry *procfolder;
+};
+
+static const struct of_device_id seven_segment_match[] = {
+    { .compatible = "sparkfun,7segment" },
+    { }
 };
 
 #endif // SEVENSEGMENT_H

@@ -1,4 +1,7 @@
-obj-m += 7-segment.o
+ssd-i2c-objs := 7-segment.o 7-segment-i2c.o
+ssd-spi-objs := 7-segment.o 7-segment-spi.o
+obj-m += ssd-i2c.o
+obj-m += ssd-spi.o
 
 PWD := $(CURDIR)
 

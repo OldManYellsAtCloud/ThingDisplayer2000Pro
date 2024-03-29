@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+	target = <&spi0>;
+	__overlay__ {
+	    status = "okay";
+
+	    #address-cells = <1>;
+	    #size-cells = <0>;
+
+	    sevensegment: sevsegm@0{
+		compatible = "sparkfun,7segment";
+		reg = <0>;
+	    };
+	};
+    };
+};
+

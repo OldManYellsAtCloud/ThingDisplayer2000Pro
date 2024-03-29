@@ -1,58 +1,45 @@
-#include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/module.h>
-
+#include <linux/string.h>
 #include <linux/proc_fs.h>
-#include <linux/sysfs.h>
-
-#include <linux/device/driver.h>
 #include <linux/i2c.h>
-#include <linux/of.h>
-
+#include <linux/spi/spi.h>
 #include "7-segment.h"
 
-static struct proc_dir_entry *procparent;
+struct proc_dir_entry *procparent;
 
-struct seven_segment_display{
-    struct i2c_client *client;
-    char text[5];
-    uint8_t digit1;
-    uint8_t digit2;
-    uint8_t digit3;
-    uint8_t digit4;
-    uint8_t brightness;
-    uint8_t decimals;
-    struct proc_dir_entry *procfolder;
-};
-
-static struct i2c_client* clients[SEVENSEGMENT_MAX_CLIENTS];
-static size_t client_counter = 0;
-
-static int seven_segment_send_cmd(struct i2c_client *client, char* cmd, size_t len){
+static int seven_segment_send_cmd(struct seven_segment_display *ssd, char* cmd, size_t len) {
     int ret;
-    ret = i2c_master_send(client, cmd, len);
+    switch (ssd->device_type){
+    case SEVENSEGMENT_I2C:
+        ret = i2c_master_send(ssd->device.i2c, cmd, len);
+        break;
+    case SEVENSEGMENT_SPI:
+    default:
+        ret = spi_write(ssd->device.spi, cmd, len);
+        break;
+    }
+
     if (ret < 0)
-        pr_err("Could not send i2c cmd \'%s\'. Error: %d\n", cmd, ret);
+        pr_err("Could not send cmd \'%s\'. Error: %d\n", cmd, ret);
     return ret;
 }
 
-static void seven_segment_reset_screen(struct i2c_client* client){
+static void seven_segment_reset_screen(struct seven_segment_display* client){
     char cmd[] = {SEVENSEGMENT_CLEAR_SCREEN};
     seven_segment_send_cmd(client, cmd, 1);
 }
 
 
-static void seven_segment_set_brightness(struct i2c_client *client, uint8_t brightness){
+static void seven_segment_set_brightness(struct seven_segment_display *client, uint8_t brightness){
     char cmd[] = {SEVENSEGMENT_BRIGHTNESS, brightness};
     seven_segment_send_cmd(client, cmd, 2);
 }
 
-static void seven_segment_factory_reset(struct i2c_client *client){
+static void seven_segment_factory_reset(struct seven_segment_display *client){
     char cmd[] = {SEVENSEGMENT_FACTORY_RESET};
     seven_segment_send_cmd(client, cmd, 1);
 }
 
-static int seven_segment_parse_and_send_text(struct i2c_client* client, char* c){
+static int seven_segment_parse_and_send_text(struct seven_segment_display* client, char* c){
     int ret, i;
     ret = strlen(c);
     if (ret > 5) {
@@ -62,10 +49,13 @@ static int seven_segment_parse_and_send_text(struct i2c_client* client, char* c)
 
     for (i = 0; i < ret - 1 ; ++i)
         seven_segment_send_cmd(client, &c[i], 1);
+
+    strncpy(client->text, c, 4);
+    client->text[4] = 0; // just to make sure that it's null-terminated.
     return ret;
 }
 
-static int seven_segment_parse_and_set_custom_digit(struct i2c_client* client, char* c, int digit){
+static int seven_segment_parse_and_set_custom_digit(struct seven_segment_display* client, char* c, int digit){
     int ret, i;
     char cmd[2];
     if (digit < 1 || digit > 4){
@@ -85,10 +75,26 @@ static int seven_segment_parse_and_set_custom_digit(struct i2c_client* client, c
     cmd[0] = (SEVENSEGMENT_DIGIT_1 + digit - 1);
     cmd[1] = i;
     seven_segment_send_cmd(client, cmd, 2);
+
+    switch(digit){
+    case 1:
+        client->digit1 = i;
+        break;
+    case 2:
+        client->digit2 = i;
+        break;
+    case 3:
+        client->digit3 = i;
+        break;
+    case 4:
+        client->digit4 = i;
+        break;
+    }
+
     return strlen(c);
 }
 
-static int seven_segment_parse_and_set_decimals(struct i2c_client *client, char* c){
+static int seven_segment_parse_and_set_decimals(struct seven_segment_display *client, char* c){
     int ret, i;
     char cmd[2];
 
@@ -104,10 +110,11 @@ static int seven_segment_parse_and_set_decimals(struct i2c_client *client, char*
     cmd[0] = SEVENSEGMENT_DECIMAL_CTRL;
     cmd[1] = i;
     seven_segment_send_cmd(client, cmd, 2);
+    client->decimals = i;
     return strlen(c);
 }
 
-static int seven_segment_parse_and_set_brightness(struct i2c_client *client, char* c){
+static int seven_segment_parse_and_set_brightness(struct seven_segment_display *client, char* c){
     int i, ret;
     ret = kstrtoint(c, 10, &i);
     if (ret < 0 ){
@@ -118,29 +125,9 @@ static int seven_segment_parse_and_set_brightness(struct i2c_client *client, cha
         return -EINVAL;
     }
     seven_segment_set_brightness(client, i);
+    client->brightness = i;
     return strlen(c);
 }
-
-static size_t seven_segment_get_free_idx(void){
-    if (!client_counter || !clients[0]){
-        return 0;
-    }
-
-    if (!clients[1])
-        return 1;
-
-    return 2;
-}
-
-static ssize_t seven_segment_get_client_idx(struct i2c_client *client){
-    ssize_t i;
-    for (i = 0; i < SEVENSEGMENT_MAX_CLIENTS; ++i){
-        if (clients[i] == client)
-            return i;
-    }
-    return -1;
-}
-
 
 static enum SevenSegmentProcFile seven_segment_get_proc_enum(char* file_name){
     if (!strncmp("brightness", file_name, strlen("brightness")))
@@ -165,18 +152,139 @@ static enum SevenSegmentProcFile seven_segment_get_proc_enum(char* file_name){
     return SEVENSEGMENT_UNKNOWN_FILE;
 }
 
-static ssize_t seven_segment_proc_write(struct file* f, const char __user* buf, size_t sz, loff_t* off){
-    enum SevenSegmentProcFile sspf;
+void seven_segment_create_proc_files(struct proc_dir_entry* parent, struct proc_ops* pops){
+    if (!proc_create("text", 0664, parent, pops))
+        pr_err("Could not create text file in procfs!\n");
+    if (!proc_create("clear", 0220, parent, pops))
+        pr_err("Could not create clear file in procfs!\n");
+    if (!proc_create("decimals", 0664, parent, pops))
+        pr_err("Could not create decimals file in procfs!\n");
+    if (!proc_create("custom_digit1", 0664, parent, pops))
+        pr_err("Could not create custom_digit1 file in procfs!\n");
+    if (!proc_create("custom_digit2", 0664, parent, pops))
+        pr_err("Could not create custom_digit2 file in procfs!\n");
+    if (!proc_create("custom_digit3", 0664, parent, pops))
+        pr_err("Could not create custom_digit3 file in procfs!\n");
+    if (!proc_create("custom_digit4", 0664, parent, pops))
+        pr_err("Could not create custom_digit4 file in procfs!\n");
+    if (!proc_create("brightness", 0664, parent, pops))
+        pr_err("Could not create brightness file in procfs!\n");
+    if (!proc_create("name", 0444, parent, pops))
+        pr_err("Could not create name file in procfs!\n");
+}
+
+EXPORT_SYMBOL(seven_segment_create_proc_files);
+
+
+static size_t seven_segment_int_number_of_digits(int i){
+    size_t digitNum = 1;
+
+    if (i < 0){
+        ++digitNum; // minus sign
+        i *= -1;
+    }
+
+    for (; i > 9; ++digitNum, i/=10);
+    return digitNum;
+}
+
+static ssize_t seven_segment_send_int_to_user(char __user** buf, loff_t** off, int i){
     int ret;
-    size_t idx;
-    char* text;
-    struct i2c_client* client;
+    char* tmp;
+    size_t digitNum = seven_segment_int_number_of_digits(i);
 
+    if (**off >= digitNum)
+        return 0;
+
+    tmp = kzalloc(digitNum, GFP_KERNEL);
+    sprintf(tmp, "%d", i);
+
+    ret = copy_to_user(*buf, tmp, digitNum);
+    if (ret < 0){
+        pr_err("Could not copy to user: %d.\n", ret);
+        ret = 0;
+    } else {
+        ret = digitNum;
+        **off += digitNum;
+    }
+    kfree(tmp);
+    return ret;
+}
+
+static ssize_t seven_segment_send_str_to_user(char __user** buf, loff_t** off, char* str){
+    int ret;
+    size_t len;
+
+    if (!str)
+        return 0;
+
+    len = strnlen(str, 64); // 64 is arbitrary limit, no special meaning
+    if (**off >= len)
+        return 0;
+
+    ret = copy_to_user(*buf, str, len);
+    if (ret < 0){
+        pr_err("Could not copy to user: %d\n", ret);
+        ret = 0;
+    } else {
+        ret = len;
+        **off += len;
+    }
+    return ret;
+}
+
+ssize_t seven_segment_read_proc_file(struct seven_segment_display *ssd, struct file* f, char __user** buf, loff_t **off){
+    ssize_t ret;
+    enum SevenSegmentProcFile sspf;
     sspf = seven_segment_get_proc_enum((char *)f->f_path.dentry->d_iname);
-    idx = f->f_path.dentry->d_parent->d_iname[0] - 48;
-    client = clients[idx];
-    text = kmalloc(sz + 1, GFP_KERNEL);
 
+    switch(sspf){
+    case SEVENSEGMENT_BRIGHTNESS_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->brightness);
+        break;
+    case SEVENSEGMENT_TEXT_FILE:
+        ret = seven_segment_send_str_to_user(buf, off, ssd->text);
+        break;
+    case SEVENSEGMENT_CUSTOM_DIGIT1_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->digit1);
+        break;
+    case SEVENSEGMENT_CUSTOM_DIGIT2_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->digit2);
+        break;
+    case SEVENSEGMENT_CUSTOM_DIGIT3_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->digit3);
+        break;
+    case SEVENSEGMENT_CUSTOM_DIGIT4_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->digit4);
+        break;
+    case SEVENSEGMENT_DECIMALS_FILE:
+        ret = seven_segment_send_int_to_user(buf, off, ssd->decimals);
+        break;
+    case SEVENSEGMENT_NAME_FILE:
+        if (ssd->device_type == SEVENSEGMENT_I2C){
+            ret = seven_segment_send_str_to_user(buf, off, ssd->device.i2c->name);
+        } else {
+            ret = seven_segment_send_str_to_user(buf, off, (char *)ssd->device.spi->dev.init_name);
+        }
+        break;
+    case SEVENSEGMENT_UNKNOWN_FILE:
+    case SEVENSEGMENT_CLEAR_FILE:
+    default:
+        pr_err("Unknown file: %s\n", f->f_path.dentry->d_iname);
+        ret = -ENOENT;
+    }
+
+    return ret;
+}
+
+EXPORT_SYMBOL(seven_segment_read_proc_file);
+
+ssize_t seven_segment_write_proc_file(struct seven_segment_display *ssd, struct file* f, const char __user* buf, size_t sz){
+    int ret;
+    enum SevenSegmentProcFile sspf;
+    char* text;
+
+    text = kmalloc(sz + 1, GFP_KERNEL);
     if (!text){
         pr_err("Could not allocate memory for text\n");
         return -ENOMEM;
@@ -189,159 +297,56 @@ static ssize_t seven_segment_proc_write(struct file* f, const char __user* buf, 
     }
     text[sz] = 0;
 
+    sspf = seven_segment_get_proc_enum((char *)f->f_path.dentry->d_iname);
+
     switch(sspf){
     case SEVENSEGMENT_BRIGHTNESS_FILE:
-        sz = seven_segment_parse_and_set_brightness(client, text);
+        sz = seven_segment_parse_and_set_brightness(ssd, text);
         break;
     case SEVENSEGMENT_CLEAR_FILE:
-        seven_segment_reset_screen(client);
+        seven_segment_reset_screen(ssd);
         break;
     case SEVENSEGMENT_TEXT_FILE:
-        sz = seven_segment_parse_and_send_text(client, text);
+        sz = seven_segment_parse_and_send_text(ssd, text);
         break;
     case SEVENSEGMENT_CUSTOM_DIGIT1_FILE:
-        sz = seven_segment_parse_and_set_custom_digit(client, text, 1);
+        sz = seven_segment_parse_and_set_custom_digit(ssd, text, 1);
         break;
     case SEVENSEGMENT_CUSTOM_DIGIT2_FILE:
-        sz = seven_segment_parse_and_set_custom_digit(client, text, 2);
+        sz = seven_segment_parse_and_set_custom_digit(ssd, text, 2);
         break;
     case SEVENSEGMENT_CUSTOM_DIGIT3_FILE:
-        sz = seven_segment_parse_and_set_custom_digit(client, text, 3);
+        sz = seven_segment_parse_and_set_custom_digit(ssd, text, 3);
         break;
     case SEVENSEGMENT_CUSTOM_DIGIT4_FILE:
-        sz = seven_segment_parse_and_set_custom_digit(client, text, 4);
+        sz = seven_segment_parse_and_set_custom_digit(ssd, text, 4);
         break;
     case SEVENSEGMENT_DECIMALS_FILE:
-        sz = seven_segment_parse_and_set_decimals(client, text);
+        sz = seven_segment_parse_and_set_decimals(ssd, text);
         break;
     case SEVENSEGMENT_UNKNOWN_FILE:
     default:
         pr_err("Unknown file: %s\n", f->f_path.dentry->d_iname);
         sz = -ENOENT;
     }
-
+    kfree(text);
     return sz;
 }
 
-ssize_t	seven_segment_proc_read(struct file *f, char __user *buf, size_t sz, loff_t *off){
-    ssize_t ret;
-    size_t idx, len;
-    struct i2c_client *client;
-    idx = f->f_path.dentry->d_parent->d_iname[0] - 48;
-    client = clients[idx];
+EXPORT_SYMBOL(seven_segment_write_proc_file);
 
-    len = strlen(client->name);
-    ret = len;
-    if (*off >= len || copy_to_user(buf, client->name, strlen(client->name))){
-        ret = 0;
-    } else {
-        *off += len;
+int seven_segment_register_top_proc_dir(void) {
+    if (!procparent){
+        procparent = proc_mkdir("ssd", NULL);
     }
 
-    return ret;
-}
-
-static struct proc_ops pops = {
-    .proc_write = seven_segment_proc_write,
-    .proc_read = seven_segment_proc_read
-};
-
-static int seven_segment_probe(struct i2c_client *client){
-    int client_idx;
-    char procfsname[2];
-
-    if (client_counter >= SEVENSEGMENT_MAX_CLIENTS - 1){
-        pr_err("Too many displays present! Max 3 are allowed.\n");
-        return -ENFILE;
-    }
-
-    if (i2c_verify_client(&client->dev)){
-        client_idx = seven_segment_get_free_idx();
-        clients[client_idx] = client;
-        procfsname[0] = client_idx + 48;
-        procfsname[1] = 0;
-
-        if (!procparent){
-            pr_err("procparent doesn't exist!\n");
-            return -ENOMEM;
-        }
-
-        struct seven_segment_display *ssd = kmalloc(sizeof(struct seven_segment_display), GFP_KERNEL);
-        ssd->procfolder = proc_mkdir(procfsname, procparent);
-
-        if (!ssd->procfolder)
-            pr_err("could not create ssd->procfolder!\n");
-
-        proc_create("text", 0220, ssd->procfolder, &pops);
-        proc_create("clear", 0220, ssd->procfolder, &pops);
-        proc_create("decimals", 0220, ssd->procfolder, &pops);
-        proc_create("custom_digit1", 0220, ssd->procfolder, &pops);
-        proc_create("custom_digit2", 0220, ssd->procfolder, &pops);
-        proc_create("custom_digit3", 0220, ssd->procfolder, &pops);
-        proc_create("custom_digit4", 0220, ssd->procfolder, &pops);
-        proc_create("brightness", 0220, ssd->procfolder, &pops);
-        proc_create("name", 0444, ssd->procfolder, &pops);
-
-        i2c_set_clientdata(client, ssd);
-    } else {
-        return -ENODEV;
-    }
-
-    return 0;
-}
-
-static void seven_segment_remove(struct i2c_client *client){
-    size_t idx;
-    struct seven_segment_display *ssd;
-    ssd = i2c_get_clientdata(client);
-    proc_remove(ssd->procfolder);
-
-    idx = seven_segment_get_client_idx(client);
-    clients[idx] = NULL;
-
-    kfree(i2c_get_clientdata(client));
-}
-
-static const struct of_device_id seven_segment_match[] = {
-    { .compatible = "sparkfun,7segment" },
-    { }
-};
-
-MODULE_DEVICE_TABLE(of, seven_segment_match);
-
-static struct i2c_driver seven_segment_driver = {
-    .probe = seven_segment_probe,
-    .remove = seven_segment_remove,
-    .driver = {
-        .name = "sev_segment",
-        .of_match_table = seven_segment_match,
-        .owner = THIS_MODULE
-    }
-};
-
-static int __init seven_segment_init(void){
-    int ret;
-
-    procparent = proc_mkdir("ssd", NULL);
     if (!procparent){
         pr_err("/proc/ssd creation failed!\n");
         return -ENOMEM;
     }
-
-    ret = i2c_register_driver(THIS_MODULE, &seven_segment_driver);
-    if (ret){
-        pr_err("Failed to register driver: %d\n", ret);
-    }
-
-    return ret;
+    return 0;
 }
 
-static void __exit seven_segment_exit(void){
-    i2c_del_driver(&seven_segment_driver);
-    proc_remove(procparent);
-}
+EXPORT_SYMBOL(seven_segment_register_top_proc_dir);
 
-module_init(seven_segment_init);
-module_exit(seven_segment_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Gyorgy Sarvari");
