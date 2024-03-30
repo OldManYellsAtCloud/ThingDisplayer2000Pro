@@ -86,8 +86,6 @@ static int seven_segment_probe(struct spi_device *spi){
         return -ENFILE;
     }
 
-    spi->max_speed_hz = 250000;
-
     client_idx = seven_segment_get_free_idx();
     clients[client_idx] = spi;
     ++spi_client_counter;
