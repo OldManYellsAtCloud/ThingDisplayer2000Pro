@@ -131,10 +131,15 @@ static void seven_segment_remove(struct spi_device *spi){
 
 MODULE_DEVICE_TABLE(of, seven_segment_match);
 
+static const struct spi_device_id seven_segment_spi_ids[] = {
+    { "7segment" },
+    { },
+};
 
 static struct spi_driver seven_segment_driver = {
     .probe = seven_segment_probe,
     .remove = seven_segment_remove,
+    .id_table = seven_segment_spi_ids,
     .driver = {
         .name = "sev_segment_spi",
         .of_match_table = seven_segment_match,
